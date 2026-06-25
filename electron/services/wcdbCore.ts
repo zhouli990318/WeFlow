@@ -139,10 +139,12 @@ export class WcdbCore {
 
   private avatarUrlCache: Map<string, { url?: string; updatedAt: number }> = new Map()
   private readonly avatarCacheTtlMs = 10 * 60 * 1000
+  private readonly avatarCacheMaxEntries = 5000
   private imageHardlinkCache: Map<string, { result: { success: boolean; data?: any; error?: string }; updatedAt: number }> = new Map()
   private videoHardlinkCache: Map<string, { result: { success: boolean; data?: any; error?: string }; updatedAt: number }> = new Map()
   private readonly hardlinkCacheTtlMs = 10 * 60 * 1000
   private readonly hardlinkCacheMaxEntries = 20000
+  private cacheCleanupTimer: ReturnType<typeof setInterval> | null = null
   private mediaStreamSessionCache: Array<{ sessionId: string; displayName: string; sortTimestamp: number }> | null = null
   private mediaStreamSessionCacheAt = 0
   private readonly mediaStreamSessionCacheTtlMs = 12 * 1000
@@ -155,7 +157,60 @@ export class WcdbCore {
   setPaths(resourcesPath: string, userDataPath: string): void {
     this.resourcesPath = resourcesPath
     this.userDataPath = userDataPath
+    this.startCacheCleanup()
     this.writeLog(`[bootstrap] setPaths resourcesPath=${resourcesPath} userDataPath=${userDataPath}`, true)
+  }
+
+  private startCacheCleanup(): void {
+    if (this.cacheCleanupTimer) return
+    this.cacheCleanupTimer = setInterval(() => {
+      const now = Date.now()
+      let cleaned = 0
+
+      // avatarUrlCache: TTL + max entries
+      for (const [key, entry] of this.avatarUrlCache) {
+        if (now - entry.updatedAt > this.avatarCacheTtlMs) {
+          this.avatarUrlCache.delete(key)
+          cleaned++
+        }
+      }
+      if (this.avatarUrlCache.size > this.avatarCacheMaxEntries) {
+        const entries = [...this.avatarUrlCache.entries()].sort((a, b) => a[1].updatedAt - b[1].updatedAt)
+        for (const [key] of entries.slice(0, this.avatarUrlCache.size - this.avatarCacheMaxEntries)) {
+          this.avatarUrlCache.delete(key)
+          cleaned++
+        }
+      }
+
+      // imageHardlinkCache / videoHardlinkCache: TTL + max entries
+      for (const cache of [this.imageHardlinkCache, this.videoHardlinkCache]) {
+        for (const [key, entry] of cache) {
+          if (now - entry.updatedAt > this.hardlinkCacheTtlMs) {
+            cache.delete(key)
+            cleaned++
+          }
+        }
+        if (cache.size > this.hardlinkCacheMaxEntries) {
+          const entries = [...cache.entries()].sort((a, b) => a[1].updatedAt - b[1].updatedAt)
+          for (const [key] of entries.slice(0, cache.size - this.hardlinkCacheMaxEntries)) {
+            cache.delete(key)
+            cleaned++
+          }
+        }
+      }
+
+      // mediaStreamSessionCache: TTL only
+      if (this.mediaStreamSessionCache && now - this.mediaStreamSessionCacheAt > this.mediaStreamSessionCacheTtlMs * 5) {
+        this.mediaStreamSessionCache = null
+        this.mediaStreamSessionCacheAt = 0
+        cleaned++
+      }
+
+      if (cleaned > 0) {
+        this.writeLog(`[wcdbCore] cache cleanup: pruned ${cleaned} stale entries`, false)
+      }
+    }, 2 * 60 * 1000)
+    if (this.cacheCleanupTimer?.unref) this.cacheCleanupTimer.unref()
   }
 
   getLastInitError(): string | null {

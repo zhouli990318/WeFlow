@@ -121,7 +121,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
   setConnecting: (connecting) => set({ isConnecting: connecting }),
   setConnectionError: (error) => set({ connectionError: error }),
 
-  setSessions: (sessions) => set({ sessions, filteredSessions: sessions }),
+  setSessions: (sessions) => set((state) => {
+    // 跳过无实质变化的更新，避免触发不必要的重渲染
+    if (
+      state.sessions.length === sessions.length &&
+      sessions.length > 0 &&
+      state.sessions.length > 0 &&
+      sessions[0].lastTimestamp === state.sessions[0].lastTimestamp &&
+      sessions[0].username === state.sessions[0].username
+    ) {
+      return state
+    }
+    return { sessions, filteredSessions: sessions }
+  }),
   setFilteredSessions: (sessions) => set({ filteredSessions: sessions }),
 
   setCurrentSession: (sessionId, options) => set((state) => {

@@ -1,7 +1,9 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useCallback } from 'react'
 import { useChatStore } from '../stores/chatStore'
 import type { ChatSession, Message } from '../types/models'
 import { useNavigate } from 'react-router-dom'
+
+const SESSION_REFRESH_DEBOUNCE_MS = 300
 
 export function GlobalSessionMonitor() {
     const navigate = useNavigate()
@@ -20,10 +22,12 @@ export function GlobalSessionMonitor() {
     }, [sessions])
 
     // 去重辅助函数：获取消息 key
-    const getMessageKey = (msg: Message) => {
+    const getMessageKey = useCallback((msg: Message) => {
         if (msg.messageKey) return msg.messageKey
         return `fallback:${msg._db_path || ''}:${msg.serverId || 0}:${msg.createTime}:${msg.sortSeq || 0}:${msg.localId || 0}:${msg.senderUsername || ''}:${msg.localType || 0}`
-    }
+    }, [])
+
+    const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
     // 处理数据库变更
     useEffect(() => {
@@ -32,9 +36,10 @@ export function GlobalSessionMonitor() {
                 const payload = JSON.parse(data.json)
                 const tableName = payload.table
 
-                // 只关注 Session 表
+                // 只关注 Session 表，防抖合并多次变更
                 if (tableName === 'Session' || tableName === 'session') {
-                    refreshSessions()
+                    if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current)
+                    refreshTimerRef.current = setTimeout(() => refreshSessions(), SESSION_REFRESH_DEBOUNCE_MS)
                 }
             } catch (e) {
                 console.error('解析数据库变更失败:', e)
@@ -45,9 +50,12 @@ export function GlobalSessionMonitor() {
             const removeListener = window.electronAPI.chat.onWcdbChange(handleDbChange)
             return () => {
                 removeListener()
+                if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current)
             }
         }
-        return () => { }
+        return () => {
+            if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current)
+        }
     }, [])
 
     const refreshSessions = async () => {
@@ -60,14 +68,21 @@ export function GlobalSessionMonitor() {
                 // 1. 检测变更并通知
                 checkForNewMessages(oldSessions, newSessions)
 
-                // 2. 更新 store
-                setSessions(newSessions)
+                // 2. 仅在会话列表有实质变化时更新 store
+                const hasChanged = !oldSessions ||
+                    oldSessions.length !== newSessions.length ||
+                    (newSessions.length > 0 && oldSessions.length > 0 &&
+                        (newSessions[0].lastTimestamp !== oldSessions[0].lastTimestamp ||
+                         newSessions[0].username !== oldSessions[0].username))
+                if (hasChanged) {
+                    setSessions(newSessions)
+                }
 
                 // 3. 如果在活跃会话中，增量刷新消息
                 const currentId = useChatStore.getState().currentSessionId
                 if (currentId) {
                     const currentSessionNew = newSessions.find(s => s.username === currentId)
-                    const currentSessionOld = oldSessions.find(s => s.username === currentId)
+                    const currentSessionOld = oldSessions?.find(s => s.username === currentId)
 
                     if (currentSessionNew && (!currentSessionOld || currentSessionNew.lastTimestamp > currentSessionOld.lastTimestamp)) {
                         void handleActiveSessionRefresh(currentId)
@@ -79,181 +94,83 @@ export function GlobalSessionMonitor() {
         }
     }
 
+    const cleanWxid = (id: string) => {
+        if (!id) return '';
+        const trimmed = id.trim();
+        const suffixMatch = trimmed.match(/^(.+)_([a-zA-Z0-9]{4})$/);
+        return suffixMatch ? suffixMatch[1] : trimmed;
+    }
+
     const checkForNewMessages = async (oldSessions: ChatSession[], newSessions: ChatSession[]) => {
-        if (!oldSessions || oldSessions.length === 0) {
-            console.log('[NotificationFilter] Skipping check on initial load (empty baseline)')
-            return
-        }
+        if (!oldSessions || oldSessions.length === 0) return
 
         const oldMap = new Map(oldSessions.map(s => [s.username, s]))
+        const currentId = useChatStore.getState().currentSessionId
 
+        // 第一遍：筛选出需要发送通知的会话
+        const toNotify: ChatSession[] = []
         for (const newSession of newSessions) {
             const oldSession = oldMap.get(newSession.username)
+            if (newSession.username === currentId) continue
+            if (oldSession && newSession.lastTimestamp <= oldSession.lastTimestamp) continue
+            if (newSession.isMuted || newSession.isFolded) continue
+            if (newSession.username.toLowerCase().includes('placeholder_foldgroup')) continue
 
-            // 条件: 新会话或时间戳更新
-            const isCurrentSession = newSession.username === useChatStore.getState().currentSessionId
-
-            if (!isCurrentSession && (!oldSession || newSession.lastTimestamp > oldSession.lastTimestamp)) {
-                // 这是新消息事件
-
-                // 免打扰、折叠群、折叠入口不弹通知
-                if (newSession.isMuted || newSession.isFolded) continue
-                if (newSession.username.toLowerCase().includes('placeholder_foldgroup')) continue
-
-                // 1. 群聊过滤自己发送的消息
-                if (newSession.username.includes('@chatroom')) {
-                    // 如果是自己发的消息，不弹通知
-                    // 注意：lastMsgSender 需要后端支持返回
-                    // 使用宽松比较以处理 wxid_ 前缀差异
-                    if (newSession.lastMsgSender && newSession.selfWxid) {
-                        const sender = newSession.lastMsgSender.replace(/^wxid_/, '');
-                        const self = newSession.selfWxid.replace(/^wxid_/, '');
-
-                        // 使用主进程日志打印，方便用户查看
-                        const debugInfo = {
-                            type: 'NotificationFilter',
-                            username: newSession.username,
-                            lastMsgSender: newSession.lastMsgSender,
-                            selfWxid: newSession.selfWxid,
-                            senderClean: sender,
-                            selfClean: self,
-                            match: sender === self
-                        };
-
-                        if (window.electronAPI.log?.debug) {
-                            window.electronAPI.log.debug(debugInfo);
-                        } else {
-                            console.log('[NotificationFilter]', debugInfo);
-                        }
-
-                        if (sender === self) {
-                            if (window.electronAPI.log?.debug) {
-                                window.electronAPI.log.debug('[NotificationFilter] Filtered own message');
-                            } else {
-                                console.log('[NotificationFilter] Filtered own message');
-                            }
-                            continue;
-                        }
-                    } else {
-                        const missingInfo = {
-                            type: 'NotificationFilter Missing info',
-                            lastMsgSender: newSession.lastMsgSender,
-                            selfWxid: newSession.selfWxid
-                        };
-                        if (window.electronAPI.log?.debug) {
-                            window.electronAPI.log.debug(missingInfo);
-                        } else {
-                            console.log('[NotificationFilter] Missing info:', missingInfo);
-                        }
-                    }
+            // 群聊过滤自己发送的消息
+            if (newSession.username.includes('@chatroom')) {
+                if (newSession.lastMsgSender && newSession.selfWxid) {
+                    if (cleanWxid(newSession.lastMsgSender) === cleanWxid(newSession.selfWxid)) continue
                 }
-
-                // 新增：如果未读数量没有增加，说明可能是自己在其他设备回复（或者已读），不弹通知
-                const oldUnread = oldSession ? oldSession.unreadCount : 0
-                const newUnread = newSession.unreadCount
-                if (newUnread <= oldUnread) {
-                    // 仅仅是状态同步（如自己在手机上发消息 or 已读），跳过通知
-                    continue
-                }
-
-                let title = newSession.displayName || newSession.username
-                let avatarUrl = newSession.avatarUrl
-                let content = newSession.summary || '[新消息]'
-
-                if (newSession.username.includes('@chatroom')) {
-                    // 1. 群聊过滤自己发送的消息
-                    // 辅助函数：清理 wxid 后缀 (如 _8602)
-                    const cleanWxid = (id: string) => {
-                        if (!id) return '';
-                        const trimmed = id.trim();
-                        // 仅移除末尾的 _xxxx (4位字母数字)
-                        const suffixMatch = trimmed.match(/^(.+)_([a-zA-Z0-9]{4})$/);
-                        return suffixMatch ? suffixMatch[1] : trimmed;
-                    }
-
-                    if (newSession.lastMsgSender && newSession.selfWxid) {
-                        const senderClean = cleanWxid(newSession.lastMsgSender);
-                        const selfClean = cleanWxid(newSession.selfWxid);
-                        const match = senderClean === selfClean;
-
-                        if (match) {
-                            continue;
-                        }
-                    }
-
-                    // 2. 群聊显示发送者名字 (放在内容中: "Name: Message")
-                    // 标题保持为群聊名称 (title 变量)
-                    if (newSession.lastSenderDisplayName) {
-                        content = `${newSession.lastSenderDisplayName}: ${content}`
-                    }
-                }
-
-                // 修复 "Random User" 的逻辑 (缺少具体信息)
-                // 如果标题看起来像 wxid 或没有头像，尝试获取信息
-                const needsEnrichment = !newSession.displayName || !newSession.avatarUrl || newSession.displayName === newSession.username
-
-                if (needsEnrichment && newSession.username) {
-                    try {
-                        // 尝试丰富或获取联系人详情
-                        const contact = await window.electronAPI.chat.getContact(newSession.username)
-                        if (contact) {
-                            if (contact.remark || contact.nickName) {
-                                title = contact.remark || contact.nickName
-                            }
-                            const avatarResult = await window.electronAPI.chat.getContactAvatar(newSession.username)
-                            if (avatarResult?.avatarUrl) {
-                                avatarUrl = avatarResult.avatarUrl
-                            }
-                        } else {
-                            // 如果不在缓存/数据库中
-                            const enrichResult = await window.electronAPI.chat.enrichSessionsContactInfo([newSession.username])
-                            if (enrichResult.success && enrichResult.contacts) {
-                                const enrichedContact = enrichResult.contacts[newSession.username]
-                                if (enrichedContact) {
-                                    if (enrichedContact.displayName) {
-                                        title = enrichedContact.displayName
-                                    }
-                                    if (enrichedContact.avatarUrl) {
-                                        avatarUrl = enrichedContact.avatarUrl
-                                    }
-                                }
-                            }
-                            // 如果仍然没有有效名称，再尝试一次获取
-                            if (title === newSession.username || title.startsWith('wxid_')) {
-                                const retried = await window.electronAPI.chat.getContact(newSession.username)
-                                if (retried) {
-                                    title = retried.remark || retried.nickName || title
-                                    const retriedAvatar = await window.electronAPI.chat.getContactAvatar(newSession.username)
-                                    if (retriedAvatar?.avatarUrl) {
-                                        avatarUrl = retriedAvatar.avatarUrl
-                                    }
-                                }
-                            }
-                        }
-                    } catch (e) {
-                        console.warn('获取通知的联系人信息失败', e)
-                    }
-                }
-
-                // 最终检查：如果标题仍是 wxid 格式，则跳过通知（避免显示乱跳用户）
-                // 群聊例外，因为群聊 username 包含 @chatroom
-                const isGroupChat = newSession.username.includes('@chatroom')
-                const isWxidTitle = title.startsWith('wxid_') && title === newSession.username
-                if (isWxidTitle && !isGroupChat) {
-                    console.warn('[NotificationFilter] 跳过无法识别的用户通知:', newSession.username)
-                    continue
-                }
-
-                // 调用 IPC 以显示独立窗口通知
-                window.electronAPI.notification?.show({
-                    title: title,
-                    content: content,
-                    avatarUrl: avatarUrl,
-                    sessionId: newSession.username
-                })
-
-                // 我们不再为 Toast 设置本地状态
+                if (newSession.unreadCount <= (oldSession?.unreadCount ?? 0)) continue
+            } else {
+                if (newSession.unreadCount <= (oldSession?.unreadCount ?? 0)) continue
             }
+            toNotify.push(newSession)
+        }
+
+        if (toNotify.length === 0) return
+
+        // 第二遍：批量获取需要 enrichment 的联系人信息
+        const needsEnrichment = toNotify.filter(s => !s.displayName || !s.avatarUrl || s.displayName === s.username)
+        const enrichmentMap = new Map<string, { displayName?: string; avatarUrl?: string }>()
+        if (needsEnrichment.length > 0) {
+            const usernames = needsEnrichment.map(s => s.username).filter(Boolean)
+            try {
+                const enrichResult = await window.electronAPI.chat.enrichSessionsContactInfo(usernames)
+                if (enrichResult.success && enrichResult.contacts) {
+                    for (const [username, info] of Object.entries(enrichResult.contacts)) {
+                        enrichmentMap.set(username, info as any)
+                    }
+                }
+            } catch { /* 忽略批量获取失败 */ }
+        }
+
+        // 第三遍：发送通知
+        for (const session of toNotify) {
+            let title = session.displayName || session.username
+            let avatarUrl = session.avatarUrl
+            let content = session.summary || '[新消息]'
+
+            if (session.username.includes('@chatroom') && session.lastSenderDisplayName) {
+                content = `${session.lastSenderDisplayName}: ${content}`
+            }
+
+            // 使用预取的 enrichment 数据
+            const enriched = enrichmentMap.get(session.username)
+            if (enriched) {
+                if (enriched.displayName) title = enriched.displayName
+                if (enriched.avatarUrl) avatarUrl = enriched.avatarUrl
+            }
+
+            const isGroupChat = session.username.includes('@chatroom')
+            if (title.startsWith('wxid_') && title === session.username && !isGroupChat) continue
+
+            window.electronAPI.notification?.show({
+                title,
+                content,
+                avatarUrl,
+                sessionId: session.username
+            })
         }
     }
 
