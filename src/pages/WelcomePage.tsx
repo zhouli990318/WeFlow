@@ -251,12 +251,14 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
           savedDbPath,
           savedCachePath,
           savedWxid,
+          savedDecryptKey,
           savedImageXorKey,
           savedImageAesKey
         ] = await Promise.all([
           configService.getDbPath(),
           configService.getCachePath(),
           configService.getMyWxid(),
+          configService.getDecryptKey(),
           configService.getImageXorKey(),
           configService.getImageAesKey()
         ])
@@ -264,8 +266,8 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
 
         setDbPath(savedDbPath || '')
         setCachePath(savedCachePath || '')
-        setDecryptKey('')
-        setHasReacquiredDbKey(false)
+        setDecryptKey(savedDecryptKey || '')
+        setHasReacquiredDbKey(!!savedDecryptKey)
         if (typeof savedImageXorKey === 'number' && Number.isFinite(savedImageXorKey)) {
           setImageXorKey(`0x${savedImageXorKey.toString(16).toUpperCase().padStart(2, '0')}`)
         }
