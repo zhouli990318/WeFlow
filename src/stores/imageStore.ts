@@ -101,12 +101,11 @@ export const useImageStore = create<ImageState>((set, get) => ({
   
   addImages: (newImages) => {
     set((state) => {
-      const updated = [...state.images, ...newImages]
-      // 计算统计
-      let original = 0
-      let thumbnail = 0
-      let decrypted = 0
-      for (const img of updated) {
+      // 增量累加统计，避免遍历全部图片
+      let original = state.originalCount
+      let thumbnail = state.thumbnailCount
+      let decrypted = state.decryptedCount
+      for (const img of newImages) {
         if (detectImageQuality(img) === 'original') {
           original++
         } else {
@@ -115,7 +114,7 @@ export const useImageStore = create<ImageState>((set, get) => ({
         if (img.isDecrypted) decrypted++
       }
       return {
-        images: updated,
+        images: [...state.images, ...newImages],
         originalCount: original,
         thumbnailCount: thumbnail,
         decryptedCount: decrypted

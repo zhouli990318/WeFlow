@@ -2,7 +2,7 @@
 import { basename, dirname, extname, join } from 'path'
 import { pathToFileURL } from 'url'
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, appendFileSync } from 'fs'
-import { writeFile, rm, readdir } from 'fs/promises'
+import { writeFile, rm, readdir, readFile as readFileAsync } from 'fs/promises'
 import { homedir, tmpdir } from 'os'
 import crypto from 'crypto'
 import { ConfigService } from './config'
@@ -179,7 +179,7 @@ export class ImageDecryptService {
         } else {
           this.updateFlags.delete(key)
         }
-        this.emitCacheResolved(payload, key, this.resolveEmitPath(finalPath, payload.preferFilePath))
+        this.emitCacheResolved(payload, key, await this.resolveEmitPath(finalPath, payload.preferFilePath))
         return { success: true, localPath, hasUpdate }
       }
       if (cached && !this.isUsableImageCacheFile(cached)) {
@@ -220,7 +220,7 @@ export class ImageDecryptService {
           } else {
             this.updateFlags.delete(cacheKey)
           }
-          this.emitCacheResolved(payload, cacheKey, this.resolveEmitPath(finalPath, payload.preferFilePath))
+          this.emitCacheResolved(payload, cacheKey, await this.resolveEmitPath(finalPath, payload.preferFilePath))
           return { success: true, localPath, hasUpdate }
         }
       }
@@ -244,7 +244,7 @@ export class ImageDecryptService {
           this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, cached)
           this.clearUpdateFlags(cacheKey, payload.imageMd5, payload.imageDatName)
           const localPath = this.resolveLocalPathForPayload(cached, payload.preferFilePath)
-          this.emitCacheResolved(payload, cacheKey, this.resolveEmitPath(cached, payload.preferFilePath))
+          this.emitCacheResolved(payload, cacheKey, await this.resolveEmitPath(cached, payload.preferFilePath))
           this.emitDecryptProgress(payload, cacheKey, 'done', 100, 'done')
           return { success: true, localPath }
         }
@@ -263,7 +263,7 @@ export class ImageDecryptService {
           : null
         const finalPath = upgraded || cached
         const localPath = this.resolveLocalPathForPayload(finalPath, payload.preferFilePath)
-        this.emitCacheResolved(payload, cacheKey, this.resolveEmitPath(finalPath, payload.preferFilePath))
+        this.emitCacheResolved(payload, cacheKey, await this.resolveEmitPath(finalPath, payload.preferFilePath))
         this.emitDecryptProgress(payload, cacheKey, 'done', 100, 'done')
         return { success: true, localPath }
       }
@@ -410,7 +410,7 @@ export class ImageDecryptService {
         this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, datPath)
         const localPath = this.resolveLocalPathForPayload(datPath, payload.preferFilePath)
         const isThumb = this.isThumbnailPath(datPath)
-        this.emitCacheResolved(payload, cacheKey, this.resolveEmitPath(datPath, payload.preferFilePath))
+        this.emitCacheResolved(payload, cacheKey, await this.resolveEmitPath(datPath, payload.preferFilePath))
         this.emitDecryptProgress(payload, cacheKey, 'done', 100, 'done')
         return { success: true, localPath, isThumb }
       }
@@ -424,7 +424,7 @@ export class ImageDecryptService {
           this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, existingFast)
           const localPath = this.resolveLocalPathForPayload(existingFast, payload.preferFilePath)
           const isThumb = this.isThumbnailPath(existingFast)
-          this.emitCacheResolved(payload, cacheKey, this.resolveEmitPath(existingFast, payload.preferFilePath))
+          this.emitCacheResolved(payload, cacheKey, await this.resolveEmitPath(existingFast, payload.preferFilePath))
           this.emitDecryptProgress(payload, cacheKey, 'done', 100, 'done')
           return { success: true, localPath, isThumb }
         }
@@ -456,7 +456,7 @@ export class ImageDecryptService {
 
       this.logInfo('开始解密DAT文件', { datPath, xorKey, hasAesKey: Boolean(aesKeyForNative) })
       this.emitDecryptProgress(payload, cacheKey, 'decrypting', 58, 'running')
-      const nativeResult = this.tryDecryptDatWithNative(datPath, xorKey, aesKeyForNative)
+      const nativeResult = await this.tryDecryptDatWithNative(datPath, xorKey, aesKeyForNative)
       if (!nativeResult) {
         this.emitDecryptProgress(payload, cacheKey, 'failed', 100, 'error', 'Rust原生解密不可用')
         return { success: false, error: 'Rust原生解密不可用或解密失败，请检查 native 模块与密钥配置', failureKind: 'not_found' }
@@ -502,7 +502,7 @@ export class ImageDecryptService {
       const localPath = payload.preferFilePath
         ? outputPath
         : (this.bufferToDataUrl(decrypted, finalExt) || this.filePathToUrl(outputPath))
-      const emitPath = this.resolveEmitPath(outputPath, payload.preferFilePath)
+      const emitPath = await this.resolveEmitPath(outputPath, payload.preferFilePath)
       this.emitCacheResolved(payload, cacheKey, emitPath)
       this.emitDecryptProgress(payload, cacheKey, 'done', 100, 'done')
       return { success: true, localPath, isThumb }
@@ -791,7 +791,7 @@ export class ImageDecryptService {
       const upgradedPath = await this.tryAutoRefreshBetterCache(payload, cacheKey, cachedPath)
       if (upgradedPath) {
         this.updateFlags.delete(cacheKey)
-        this.emitCacheResolved(payload, cacheKey, this.resolveEmitPath(upgradedPath, payload.preferFilePath))
+        this.emitCacheResolved(payload, cacheKey, await this.resolveEmitPath(upgradedPath, payload.preferFilePath))
         return
       }
       this.emitImageUpdate(payload, cacheKey)
@@ -1520,11 +1520,11 @@ export class ImageDecryptService {
     this.ensuredDirs.add(dirPath)
   }
 
-  private tryDecryptDatWithNative(
+  private async tryDecryptDatWithNative(
     datPath: string,
     xorKey: number,
     aesKey?: string
-  ): { data: Buffer; ext: string; isWxgf: boolean } | null {
+  ): Promise<{ data: Buffer; ext: string; isWxgf: boolean } | null> {
     const result = decryptDatViaNative(datPath, xorKey, aesKey)
     if (!this.nativeLogged) {
       this.nativeLogged = true
@@ -1541,20 +1541,20 @@ export class ImageDecryptService {
       }
     }
     if (result) return result
-    const fallback = this.tryDecryptDatWithJs(datPath, xorKey, aesKey)
+    const fallback = await this.tryDecryptDatWithJs(datPath, xorKey, aesKey)
     if (fallback) {
       this.logInfo('JS DAT 解密 fallback 已启用', { datPath, ext: fallback.ext })
     }
     return fallback
   }
 
-  private tryDecryptDatWithJs(
+  private async tryDecryptDatWithJs(
     datPath: string,
     xorKey: number,
     aesKey?: string
-  ): { data: Buffer; ext: string; isWxgf: boolean } | null {
+  ): Promise<{ data: Buffer; ext: string; isWxgf: boolean } | null> {
     try {
-      const encrypted = readFileSync(datPath)
+      const encrypted = await readFile(datPath)
       const directExt = this.detectImageExtension(encrypted)
       if (directExt) return { data: encrypted, ext: directExt, isWxgf: false }
 
@@ -1673,20 +1673,20 @@ export class ImageDecryptService {
 
   private resolveLocalPathForPayload(filePath: string, preferFilePath?: boolean): string {
     if (preferFilePath) return filePath
-    return this.resolveEmitPath(filePath, false)
+    return this.filePathToUrl(filePath)
   }
 
-  private resolveEmitPath(filePath: string, preferFilePath?: boolean): string {
+  private async resolveEmitPath(filePath: string, preferFilePath?: boolean): Promise<string> {
     if (preferFilePath) return this.filePathToUrl(filePath)
-    return this.fileToDataUrl(filePath) || this.filePathToUrl(filePath)
+    return (await this.fileToDataUrl(filePath)) || this.filePathToUrl(filePath)
   }
 
-  private fileToDataUrl(filePath: string): string | null {
+  private async fileToDataUrl(filePath: string): Promise<string | null> {
     try {
       const ext = extname(filePath).toLowerCase()
       const mimeType = this.mimeFromExtension(ext)
       if (!mimeType) return null
-      const data = readFileSync(filePath)
+      const data = await readFileAsync(filePath)
       return `data:${mimeType};base64,${data.toString('base64')}`
     } catch {
       return null

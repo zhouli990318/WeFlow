@@ -441,6 +441,9 @@ class ChatService {
   private readonly contactDisplayNameCollator = new Intl.Collator('zh-CN')
   private readonly slowGetContactsLogThresholdMs = 1200
 
+  private cacheCleanupTimer: ReturnType<typeof setInterval> | null = null
+  private readonly cacheCleanupIntervalMs = 2 * 60 * 1000 // 2 分钟
+
   constructor() {
     this.configService = new ConfigService()
     this.contactCacheService = new ContactCacheService(this.configService.getCacheBasePath())
@@ -453,6 +456,106 @@ class ChatService {
     // 初始化LRU缓存，限制大小防止内存泄漏
     this.voiceWavCache = new LRUCache(this.voiceWavCacheMaxEntries)
     this.voiceTranscriptCache = new LRUCache(1000) // 最多缓存1000条转写记录
+    this.startCacheCleanupTimer()
+  }
+
+  /**
+   * 定期清理所有带 TTL 的 Map 中的过期条目，防止内存无限增长
+   */
+  private startCacheCleanupTimer(): void {
+    if (this.cacheCleanupTimer) return
+    this.cacheCleanupTimer = setInterval(() => {
+      this.cleanupStaleEntries()
+    }, this.cacheCleanupIntervalMs)
+    // 不阻止进程退出
+    if (this.cacheCleanupTimer?.unref) this.cacheCleanupTimer.unref()
+  }
+
+  private cleanupStaleEntries(): void {
+    const now = Date.now()
+    let cleaned = 0
+
+    const pruneMap = <T extends { updatedAt: number }>(map: Map<string, T>, ttlMs: number, maxEntries?: number) => {
+      for (const [key, entry] of map) {
+        if (now - entry.updatedAt > ttlMs) {
+          map.delete(key)
+          cleaned++
+        }
+      }
+      // 超出上限时淘汰最旧的条目
+      if (maxEntries && map.size > maxEntries) {
+        const entries = [...map.entries()].sort((a, b) => a[1].updatedAt - b[1].updatedAt)
+        const toRemove = entries.slice(0, map.size - maxEntries)
+        for (const [key] of toRemove) {
+          map.delete(key)
+          cleaned++
+        }
+      }
+    }
+
+    const pruneSimpleMap = (map: Map<string, any>, ttlMs: number) => {
+      for (const [key, val] of map) {
+        if (typeof val === 'object' && val !== null && typeof val.updatedAt === 'number') {
+          if (now - val.updatedAt > ttlMs) { map.delete(key); cleaned++ }
+        }
+      }
+    }
+
+    // sessionTablesCache: { tables; updatedAt }
+    pruneSimpleMap(this.sessionTablesCache as any, this.sessionTablesCacheTtl)
+    // messageTableColumnsCache: { columns; updatedAt }
+    pruneSimpleMap(this.messageTableColumnsCache as any, this.messageTableColumnsCacheTtlMs)
+    // sessionMessageCountCache: { count; updatedAt }
+    pruneMap(this.sessionMessageCountCache, this.sessionMessageCountCacheTtlMs)
+    // sessionDetailFastCache
+    pruneMap(this.sessionDetailFastCache, this.sessionDetailFastCacheTtlMs)
+    // sessionDetailExtraCache
+    pruneMap(this.sessionDetailExtraCache, this.sessionDetailExtraCacheTtlMs)
+    // sessionStatusCache
+    pruneMap(this.sessionStatusCache, this.sessionStatusCacheTtlMs)
+    // sessionStatsMemoryCache — 使用 LRU 上限
+    pruneMap(this.sessionStatsMemoryCache, this.sessionStatsCacheTtlMs, 2000)
+    // groupMyMessageCountMemoryCache
+    pruneMap(this.groupMyMessageCountMemoryCache, this.sessionStatsCacheTtlMs, 2000)
+    // contactsMemoryCache — 只有 lite/full 两个 key，简单清理
+    for (const [key, val] of this.contactsMemoryCache) {
+      if (now - val.updatedAt > this.contactsMemoryCacheTtlMs) {
+        this.contactsMemoryCache.delete(key)
+        cleaned++
+      }
+    }
+    // messageName2IdTableCache / messageSenderIdCache — 无 TTL，但总量有上限
+    if (this.messageName2IdTableCache.size > 5000) {
+      this.messageName2IdTableCache.clear()
+      cleaned++
+    }
+    if (this.messageSenderIdCache.size > 5000) {
+      this.messageSenderIdCache.clear()
+      cleaned++
+    }
+    // sessionMessageCountHintCache — 无 TTL，限制上限
+    if (this.sessionMessageCountHintCache.size > 5000) {
+      this.sessionMessageCountHintCache.clear()
+      cleaned++
+    }
+    // syntheticUnreadState — 无 TTL，限制上限
+    if (this.syntheticUnreadState.size > 5000) {
+      this.syntheticUnreadState.clear()
+      cleaned++
+    }
+    // visibilityAnomalyLogState
+    for (const [key, val] of this.visibilityAnomalyLogState) {
+      if (now - val.windowStart > this.visibilityAnomalyLogWindowMs * 2) {
+        this.visibilityAnomalyLogState.delete(key)
+        cleaned++
+      }
+    }
+    // sessionsCache (短时缓存)
+    this.sessionsCache = null
+
+    if (cleaned > 0) {
+      console.log(`[ChatService] cache cleanup: pruned ${cleaned} stale entries`)
+    }
   }
 
   setRuntimeConfig(config: { dbPath?: string; decryptKey?: string; myWxid?: string; resourcesPath?: string; appPath?: string; isPackaged?: boolean }): void {
@@ -598,6 +701,14 @@ class ChatService {
 
   private monitorSetup = false
 
+  // 短时会话缓存，避免同一帧内重复查询
+  private sessionsCache: { data: ChatSession[]; at: number } | null = null
+  private readonly sessionsCacheTtlMs = 200
+
+  clearSessionsCache(): void {
+    this.sessionsCache = null
+  }
+
   addDbMonitorListener(listener: (type: string, json: string) => void): () => void {
     this.dbMonitorListeners.add(listener)
     return () => {
@@ -612,6 +723,7 @@ class ChatService {
     // 使用 C++数据服务内部的文件监控 (ReadDirectoryChangesW)
     // 这种方式更高效，且不占用 JS 线程，并能直接监听 session/message 目录变更
     wcdbService.setMonitor((type, json) => {
+      this.clearSessionsCache()
       this.handleSessionStatsMonitorChange(type, json)
       for (const listener of this.dbMonitorListeners) {
         try {
@@ -823,6 +935,11 @@ class ChatService {
    */
   async getSessions(): Promise<{ success: boolean; sessions?: ChatSession[]; error?: string }> {
     try {
+      const now = Date.now()
+      if (this.sessionsCache && now - this.sessionsCache.at < this.sessionsCacheTtlMs) {
+        return { success: true, sessions: this.sessionsCache.data }
+      }
+
       const connectResult = await this.ensureConnected()
       if (!connectResult.success) {
         return { success: false, error: connectResult.error }
@@ -963,6 +1080,7 @@ class ChatService {
 
       // 不等待联系人信息加载，直接返回基础会话列表
       // 前端可以异步调用 enrichSessionsWithContacts 来补充信息
+      this.sessionsCache = { data: sessions, at: Date.now() }
       return { success: true, sessions }
     } catch (e) {
       console.error('ChatService: 获取会话列表失败:', e)

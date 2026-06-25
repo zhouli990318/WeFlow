@@ -2383,7 +2383,11 @@ function registerIpcHandlers() {
     if (!accountDir) {
       return { success: false, error: '未找到账号目录' }
     }
-    return wcdbService.testConnection(accountDir, hexKey)
+    const effectiveKey = hexKey?.trim() || String(cfg.get('decryptKey') || '').trim()
+    if (!effectiveKey) {
+      return { success: false, error: '未配置解密密钥' }
+    }
+    return wcdbService.testConnection(accountDir, effectiveKey)
   })
 
   ipcMain.handle('wcdb:open', async (_, dbPath: string, hexKey: string, wxid: string) => {
@@ -2392,7 +2396,11 @@ function registerIpcHandlers() {
     if (!accountDir) {
       return false
     }
-    return wcdbService.open(accountDir, hexKey)
+    const effectiveKey = hexKey?.trim() || String(cfg.get('decryptKey') || '').trim()
+    if (!effectiveKey) {
+      return false
+    }
+    return wcdbService.open(accountDir, effectiveKey)
   })
 
   ipcMain.handle('wcdb:close', async () => {

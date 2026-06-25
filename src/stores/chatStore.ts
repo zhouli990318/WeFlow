@@ -121,7 +121,28 @@ export const useChatStore = create<ChatState>((set, get) => ({
   setConnecting: (connecting) => set({ isConnecting: connecting }),
   setConnectionError: (error) => set({ connectionError: error }),
 
-  setSessions: (sessions) => set({ sessions, filteredSessions: sessions }),
+  setSessions: (sessions) => set((state) => {
+    // 跳过无实质变化的更新，避免触发不必要的重渲染
+    if (
+      state.sessions.length === sessions.length &&
+      sessions.length > 0 &&
+      state.sessions.length > 0 &&
+      sessions[0].lastTimestamp === state.sessions[0].lastTimestamp &&
+      sessions[0].username === state.sessions[0].username
+    ) {
+      return state
+    }
+    // 仅在有搜索关键词时同步更新 filteredSessions
+    const keyword = state.searchKeyword?.trim().toLowerCase()
+    if (keyword) {
+      const filtered = sessions.filter(s =>
+        (s.displayName || '').toLowerCase().includes(keyword) ||
+        s.username.toLowerCase().includes(keyword)
+      )
+      return { sessions, filteredSessions: filtered }
+    }
+    return { sessions, filteredSessions: sessions }
+  }),
   setFilteredSessions: (sessions) => set({ filteredSessions: sessions }),
 
   setCurrentSession: (sessionId, options) => set((state) => {
@@ -145,6 +166,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
   appendMessages: (newMessages, prepend = false) => set((state) => {
     const currentMessages = state.messages || []
     if (messageAliasIndex.size === 0 && currentMessages.length > 0) {
+      rebuildMessageAliasIndex(currentMessages)
+    }
+
+    // 防止索引无限增长：超过 5000 条消息等效的索引大小时重建
+    if (messageAliasIndex.size > 20000) {
       rebuildMessageAliasIndex(currentMessages)
     }
 
